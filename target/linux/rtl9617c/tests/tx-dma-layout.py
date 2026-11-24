@@ -60,7 +60,7 @@ region = source[source.index('/* BEGIN rtl-ni-tx-hdr'):
                 source.index('/* END rtl-ni-tx-hdr')]
 fields = '\n'.join(re.findall(
     r'^#define (?:RTL_NI_(?:HDR_A|LSO_PARA0)_[A-Z0-9_]+|RTL_NI_DMA_(?:BUF_SIZE|HDR_LEN)|'
-    r'RTL_NI_TX_GSO_MAX)\s+.*$', private, re.M))
+    r'RTL_NI_TX_GSO_MAX(?:_SG)?)\s+.*$', private, re.M))
 types = (struct_of(private, 'rtl_ni_tx_hdr') +
          struct_of(private, 'rtl_ni_tx_l4info') +
          struct_of(private, 'rtl_ni_tx_offload') +
@@ -172,6 +172,8 @@ _Static_assert(RTL_NI_TX_GSO_MAX + RTL_NI_DMA_HDR_LEN == RTL_NI_DMA_BUF_SIZE,
 	       "gso_max_size vs descriptor buffer");
 _Static_assert(RTL_NI_TX_GSO_MAX <= RTL_NI_HDR_A_PKT_SIZE_MAX,
 	       "pkt_size must hold a super-packet");
+_Static_assert(RTL_NI_TX_GSO_MAX_SG <= 65535U,
+	       "SG gso_max_size must fit 16-bit lso_para1");
 '''
 
 tests = r'''
@@ -735,6 +737,83 @@ static void test_offload_header(void)
 	assert((le64(oem + 8) & RTL_NI_HDR_A_PKT_SIZE) >> 47 == 2032);
 }
 
+static void test_sg_desc_ctrl(void)
+{
+	/* Single-descriptor bounce matches legacy 0x61000002 / OAM 0x61000000. */
+	assert(rtl_ni_dma_desc_ctrl(1534, true, true, true, false) ==
+	       (0x61000002U | (1534U << 8)));
+	assert(rtl_ni_dma_desc_ctrl(76, true, true, true, true) ==
+	       (0x61000000U | (76U << 8)));
+
+	/* Multi-descriptor SG chain: header desc, middle frag, final frag. */
+	assert(rtl_ni_dma_desc_ctrl(RTL_NI_DMA_HDR_LEN, true, false, true, false) ==
+	       0x41001002U);
+	assert(rtl_ni_dma_desc_ctrl(4096, false, false, false, false) ==
+	       (0x00000002U | (4096U << 8)));
+	assert(rtl_ni_dma_desc_ctrl(1448, false, true, false, false) ==
+	       (0x20000002U | (1448U << 8)));
+}
+
+static void test_sg_offload_prepare(void)
+{
+	struct rtl_ni_tx_offload tso4 = {.segment = true, .csum = true,
+					 .gso_size = 1460, .mtu = 1500};
+	struct rtl_ni_tx_offload tso6 = {.segment = true, .segment_ipv6 = true,
+					 .csum = true, .gso_size = 1440,
+					 .mtu = 1500};
+	struct rtl_ni_tx_offload csum = {.csum = true, .mtu = 1500};
+	u8 head[256];
+	u32 para0 = 0;
+
+	/* 64 KiB IPv4/TCP TSO super-packet with only headers in linear head. */
+	memset(head, 0, sizeof(head));
+	eth_hdr(head, RTL_NI_ETH_P_IP);
+	ipv4_hdr(head, 14, RTL_NI_IPPROTO_TCP, 0, 0);
+	tcp_hdr(head, 34, 5);
+	assert(rtl_ni_tx_offload_prepare_sg(head, 54, 65500, &tso4, &para0) == 0);
+	assert(para0 == (FIELD_PREP(RTL_NI_LSO_PARA0_SEGMENT_SIZE, 1514) |
+			 RTL_NI_LSO_PARA0_SEGMENT_EN |
+			 RTL_NI_LSO_PARA0_IPV4_EN |
+			 RTL_NI_LSO_PARA0_TCP_EN));
+
+	/* 64 KiB IPv6/TCP TSO super-packet with paged payload fragments. */
+	memset(head, 0, sizeof(head));
+	eth_hdr(head, RTL_NI_ETH_P_IPV6);
+	ipv6_hdr(head, 14, RTL_NI_IPPROTO_TCP, 0);
+	tcp_hdr(head, 54, 5);
+	assert(rtl_ni_tx_offload_prepare_sg(head, 74, 65500, &tso6, &para0) == 0);
+	assert(para0 == (FIELD_PREP(RTL_NI_LSO_PARA0_SEGMENT_SIZE, 1514) |
+			 RTL_NI_LSO_PARA0_SEGMENT_EN |
+			 RTL_NI_LSO_PARA0_IPV6_EN |
+			 RTL_NI_LSO_PARA0_TCP_EN));
+
+	/* Non-linear TCP checksum-only offload succeeds without linearizing. */
+	memset(head, 0, sizeof(head));
+	eth_hdr(head, RTL_NI_ETH_P_IP);
+	ipv4_hdr(head, 14, RTL_NI_IPPROTO_TCP, 1500, 0);
+	tcp_hdr(head, 34, 5);
+	assert(rtl_ni_tx_offload_prepare_sg(head, 54, 1514, &csum, &para0) == 0);
+	assert(para0 == (FIELD_PREP(RTL_NI_LSO_PARA0_SEGMENT_SIZE, 1514) |
+			 RTL_NI_LSO_PARA0_SEGMENT_EN |
+			 RTL_NI_LSO_PARA0_IPV4_EN |
+			 RTL_NI_LSO_PARA0_TCP_EN));
+
+	/* Truncated linear head (missing TCP header) is rejected cleanly. */
+	para0 = 0xdeadbeef;
+	assert(rtl_ni_tx_offload_prepare_sg(head, 40, 1514, &csum, &para0) < 0);
+	assert(para0 == 0);
+
+	/* Non-linear UDP checksum-only falls back to skb_checksum_help(). */
+	memset(head, 0, sizeof(head));
+	eth_hdr(head, RTL_NI_ETH_P_IP);
+	ipv4_hdr(head, 14, RTL_NI_IPPROTO_UDP, 1486, 0);
+	udp_hdr(head, 34, 1466, 0xbeef);
+	para0 = 0xdeadbeef;
+	assert(rtl_ni_tx_offload_prepare_sg(head, 42, 1500, &csum, &para0) ==
+	       -EOPNOTSUPP);
+	assert(para0 == 0);
+}
+
 int main(void)
 {
 	test_word_offsets();
@@ -748,10 +827,13 @@ int main(void)
 	test_udp_precompute();
 	test_tso_offload();
 	test_offload_header();
+	test_sg_desc_ctrl();
+	test_sg_offload_prepare();
 	puts("PASS: OEM header words (lso_para0@+0, lso_para1@+4, header_a@+8); "
 	     "header_a cos/ldpid/lspid/pkt_size/fe_bypass/hdr_type; S1 byte identity "
 	     "with the pre-S1 encoder; S2 pkt_size policy; S3 classifier; "
 	     "S4 csum enables + OEM UDP precompute; S5 segment_en/gso_size; "
+	     "SG desc ctrl (SOF/EOF/HP0) + 64 KiB SG TSO/CSUM prepare; "
 	     "all offload switches default off and change nothing");
 	return 0;
 }
