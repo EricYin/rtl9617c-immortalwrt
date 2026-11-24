@@ -1,0 +1,28 @@
+From: Leo <62428370+LeoooChen@users.noreply.github.com>
+Subject: [PATCH] firewall4: resolve VLAN lower devices from the netifd class
+
+netifd reports its device class as type (VLAN, 8021q, 8021ad or bridge).
+The optional sysfs devtype is absent for some VLAN interfaces, so fall
+back to the netifd class while retaining the existing devtype behavior.
+
+Signed-off-by: Leo <62428370+LeoooChen@users.noreply.github.com>
+
+--- a/root/usr/share/ucode/fw4.uc
++++ b/root/usr/share/ucode/fw4.uc
+@@ -480,11 +480,14 @@ function resolve_lower_devices(devstatus
+ 
+ 	if (dir) {
+ 		let devtype = devstatus[devname]?.devtype ??
+-			match(fs.readfile(`/sys/class/net/${devname}/uevent`), /DEVTYPE=([^\n]+)/)?.[1];
++			match(fs.readfile(`/sys/class/net/${devname}/uevent`), /DEVTYPE=([^\n]+)/)?.[1] ??
++			devstatus[devname]?.type;
+ 
+-		switch (devtype) {
++		switch (lc(devtype)) {
+ 		case 'vlan':
++		case '8021q':
++		case '8021ad':
+ 		case 'bridge':
+ 			let e;
+ 
+ 			while ((e = dir.read()) != null)
